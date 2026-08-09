@@ -151,7 +151,7 @@ extension Args {
     K3 (.gturbo v2 bundle) options:
       --reasoning-effort <e>    Thinking effort: low, high, or max (default off).
       --no-thinking             Drop the assistant think channel.
-      --prefill <mode>          Prompt prefill: serial or chunked (default chunked).
+      --k3-prefill <mode>       Prompt prefill: serial or chunked (default chunked).
       --prefill-chunk <int>     Chunked-prefill chunk tokens: 32, 64, 128, or 256
                                 (K3 default 32).
       --expert-predict <mode>   off, selective, or on/full (default off).
@@ -226,7 +226,7 @@ extension Args {
                     throw ArgsError.invalidValue(flag: flag, value: value)
                 }
                 reasoningEffort = value
-            case "--prefill":
+            case "--k3-prefill":
                 let value = try takeValue(argv, &index, flag: flag)
                 guard ["serial", "chunked"].contains(value) else {
                     throw ArgsError.invalidValue(flag: flag, value: value)

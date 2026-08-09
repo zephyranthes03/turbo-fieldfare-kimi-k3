@@ -57,7 +57,7 @@ swift run -c release TurboFieldfareCLI \
 # Batch: --batch-file jobs.jsonl (loads the engine once, JSONL in/out; see
 #        docs/K3_DISK_RUNTIME.md)
 # Context: --max-context up to 262144 (K3 only; Gemma stays capped at 65536)
-# Prefill: --prefill chunked --prefill-chunk 32|64|128|256 (32 is the K3 default; NAX on M5)
+# Prefill: --k3-prefill chunked --prefill-chunk 32|64|128|256 (32 is the K3 default; NAX on M5)
 # Expert prefetch: --expert-predict off|selective|on (default off — measured
 #        slower than on-demand reads on real weights, see
 #        docs/KIMI_K3_EVALUATION.md §5)

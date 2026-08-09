@@ -25,7 +25,7 @@ import Testing
         let arguments = try Args.parse([
             "--model", "m.gturbo", "--messages-file", "chat.json",
             "--reasoning-effort", "high", "--no-thinking",
-            "--prefill", "serial", "--prefill-chunk", "64",
+            "--k3-prefill", "serial", "--prefill-chunk", "64",
             "--expert-predict", "selective", "--expert-cache-gib", "24",
             "--expert-shard-root", "/Volumes/ssd1/k3",
             "--expert-shard-root", "/Volumes/ssd2/k3",
@@ -94,13 +94,13 @@ import Testing
     @Test func prefillAcceptsSerialOrChunked() throws {
         for value in ["serial", "chunked"] {
             let arguments = try Args.parse([
-                "--model", "m.gturbo", "--prompt", "hi", "--prefill", value,
+                "--model", "m.gturbo", "--prompt", "hi", "--k3-prefill", value,
             ])
             #expect(arguments.prefill == value)
         }
-        #expect(throws: ArgsError.invalidValue(flag: "--prefill", value: "fast")) {
+        #expect(throws: ArgsError.invalidValue(flag: "--k3-prefill", value: "fast")) {
             _ = try Args.parse([
-                "--model", "m.gturbo", "--prompt", "hi", "--prefill", "fast",
+                "--model", "m.gturbo", "--prompt", "hi", "--k3-prefill", "fast",
             ])
         }
     }
@@ -242,7 +242,7 @@ import Testing
     }
 
     @Test func k3FlagsRequireValues() {
-        for flag in ["--reasoning-effort", "--prefill", "--prefill-chunk",
+        for flag in ["--reasoning-effort", "--k3-prefill", "--prefill-chunk",
                      "--expert-predict", "--expert-cache-gib", "--expert-shard-root",
                      "--expert-io-workers",
                      "--expert-io-splits", "--expert-io-cache",
