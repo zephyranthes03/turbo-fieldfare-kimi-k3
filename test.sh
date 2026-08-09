@@ -1,4 +1,4 @@
-.build/release/TurboFieldfareCLI \
+.build/release/TurboFieldfareCLI \                       ✔ 
   --model scratch/kimi-k3.gturbo \
   --messages-file messages.json \
   --no-thinking \
