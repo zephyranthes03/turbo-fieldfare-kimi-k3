@@ -1,3 +1,5 @@
+import TurboFieldfare
+
 public struct Args: Equatable, Sendable {
     public var model: String
     public var prompt: String?
@@ -17,6 +19,12 @@ public struct Args: Equatable, Sendable {
     public var seed: UInt64?
     public var stops: [String]
     public var quiet: Bool
+    // Gemma (v1) runtime controls; ignored on the K3 (v2) path.
+    public var expertCacheSlots: Int
+    public var expertCachePolicy: RuntimeExpertCachePolicy
+    public var prefillPolicy: RuntimePrefillPolicy
+    public var prefillChunkTokens: Int
+    public var rdadvisePolicy: RDAdvicePolicyMode
     // K3 (.gturbo v2) options; ignored on the Gemma (v1) path.
     public var reasoningEffort: String?
     public var noThinking: Bool
@@ -55,6 +63,11 @@ public struct Args: Equatable, Sendable {
                 seed: UInt64? = nil,
                 stops: [String] = [],
                 quiet: Bool = false,
+                expertCacheSlots: Int = RuntimeConfiguration.production.expertCacheSlots,
+                expertCachePolicy: RuntimeExpertCachePolicy = RuntimeConfiguration.production.expertCachePolicy,
+                prefillPolicy: RuntimePrefillPolicy = RuntimeConfiguration.production.prefillPolicy,
+                prefillChunkTokens: Int = RuntimeConfiguration.production.prefillChunkTokens,
+                rdadvisePolicy: RDAdvicePolicyMode = RuntimeConfiguration.production.rdadvisePolicy,
                 reasoningEffort: String? = nil,
                 noThinking: Bool = false,
                 prefill: String = "chunked",
@@ -84,6 +97,11 @@ public struct Args: Equatable, Sendable {
         self.seed = seed
         self.stops = stops
         self.quiet = quiet
+        self.expertCacheSlots = expertCacheSlots
+        self.expertCachePolicy = expertCachePolicy
+        self.prefillPolicy = prefillPolicy
+        self.prefillChunkTokens = prefillChunkTokens
+        self.rdadvisePolicy = rdadvisePolicy
         self.reasoningEffort = reasoningEffort
         self.noThinking = noThinking
         self.prefill = prefill
@@ -137,16 +155,24 @@ extension Args {
       --batch-file <path>       K3 JSONL jobs; each row contains prompt or messages.
 
     options:
-      --max-new <int>           Generated-token limit (default 1024).
-      --max-context <int>       Context limit in tokens (default 4096).
-      --temperature <float>     Sampling temperature (default 0.2; 0 = greedy).
-      --top-k <int>             Top-k truncation, 1...256 (default 64; 0 = off).
-      --top-p <float>           Nucleus truncation (default 0.95).
-      --repetition-penalty <f>  Repetition penalty (default 1.0).
-      --seed <uint64>           Deterministic sampling seed (default off).
-      --stop <string>           Stop substring (repeatable).
-      --quiet                   Suppress the timing footer.
-      --help                    Show this message.
+      --max-new <int>            Generated-token limit (default 1024).
+      --max-context <int>        Context limit in tokens (default 4096).
+      --temperature <float>      Sampling temperature (default 0.2; 0 = greedy).
+      --top-k <int>              Top-k truncation, 1...256 (default 64; 0 = off).
+      --top-p <float>            Nucleus truncation (default 0.95).
+      --repetition-penalty <f>   Repetition penalty (default 1.0).
+      --seed <uint64>            Deterministic sampling seed (default off).
+      --stop <string>            Stop substring (repeatable).
+      --quiet                    Suppress the timing footer.
+      --expert-cache-slots <n>   Gemma expert-cache slots: 8, 16, 24, or 32 (default 16).
+      --expert-cache-policy <s>  Gemma expert-cache policy: lfu or lru (default lfu).
+      --prefill on|off           Gemma: enable or disable chunked prompt prefill
+                                 (default on). Chunked prefill requires 16 or
+                                 more cache slots.
+      --prefill-chunk-tokens <n> Gemma prefill chunk size: 32, 64, or 128 (default 128).
+      --rdadvise <s>             Gemma read-advice policy: off, default, bounded,
+                                 or adaptive (default off).
+      --help                     Show this message.
 
     K3 (.gturbo v2 bundle) options:
       --reasoning-effort <e>    Thinking effort: low, high, or max (default off).
@@ -171,6 +197,32 @@ extension Args {
       --verbose                 Extra expert-streaming stats after the footer.
     """
 
+    public func resolvedRuntimeConfiguration(
+        forceLogitsHead: Bool) throws -> RuntimeConfiguration {
+        guard RuntimeConfiguration.allowedExpertCacheSlots.contains(expertCacheSlots) else {
+            throw ArgsError.invalidValue(
+                flag: "--expert-cache-slots", value: "\(expertCacheSlots)")
+        }
+        guard RuntimeConfiguration.allowedPrefillChunkTokens.contains(prefillChunkTokens) else {
+            throw ArgsError.invalidValue(
+                flag: "--prefill-chunk-tokens", value: "\(prefillChunkTokens)")
+        }
+        let chunkedPrefillSupported = expertCacheSlots >=
+            RuntimeConfiguration.minimumExpertCacheSlotsForChunkedPrefill
+        guard prefillPolicy == .off || chunkedPrefillSupported else {
+            throw ArgsError.invalidValue(
+                flag: "--expert-cache-slots",
+                value: "\(expertCacheSlots) requires --prefill off")
+        }
+        return RuntimeConfiguration(
+            expertCacheSlots: expertCacheSlots,
+            expertCachePolicy: expertCachePolicy,
+            rdadvisePolicy: rdadvisePolicy,
+            prefillEnabled: prefillPolicy == .chunked,
+            prefillChunkTokens: prefillChunkTokens,
+            forceLogitsHead: forceLogitsHead)
+    }
+
     public static func parse(_ argv: [String]) throws -> Args {
         var model: String?
         var prompt: String?
@@ -187,6 +239,12 @@ extension Args {
         var seed: UInt64?
         var stops: [String] = []
         var quiet = false
+        let runtimeDefaults = RuntimeConfiguration.production
+        var expertCacheSlots = runtimeDefaults.expertCacheSlots
+        var expertCachePolicy = runtimeDefaults.expertCachePolicy
+        var prefillPolicy = runtimeDefaults.prefillPolicy
+        var prefillChunkTokens = runtimeDefaults.prefillChunkTokens
+        var rdadvisePolicy = runtimeDefaults.rdadvisePolicy
         var reasoningEffort: String?
         var noThinking = false
         var prefill = "chunked"
@@ -337,6 +395,39 @@ extension Args {
                 seed = parsed
             case "--stop":
                 stops.append(try takeValue(argv, &index, flag: flag))
+            case "--expert-cache-slots":
+                let value = try takeValue(argv, &index, flag: flag)
+                guard let parsed = Int(value),
+                      RuntimeConfiguration.allowedExpertCacheSlots.contains(parsed) else {
+                    throw ArgsError.invalidValue(flag: flag, value: value)
+                }
+                expertCacheSlots = parsed
+            case "--expert-cache-policy":
+                let value = try takeValue(argv, &index, flag: flag)
+                guard let parsed = RuntimeExpertCachePolicy(rawValue: value) else {
+                    throw ArgsError.invalidValue(flag: flag, value: value)
+                }
+                expertCachePolicy = parsed
+            case "--prefill":
+                let value = try takeValue(argv, &index, flag: flag)
+                switch value {
+                case "on": prefillPolicy = .chunked
+                case "off": prefillPolicy = .off
+                default: throw ArgsError.invalidValue(flag: flag, value: value)
+                }
+            case "--prefill-chunk-tokens":
+                let value = try takeValue(argv, &index, flag: flag)
+                guard let parsed = Int(value),
+                      RuntimeConfiguration.allowedPrefillChunkTokens.contains(parsed) else {
+                    throw ArgsError.invalidValue(flag: flag, value: value)
+                }
+                prefillChunkTokens = parsed
+            case "--rdadvise":
+                let value = try takeValue(argv, &index, flag: flag)
+                guard let parsed = RDAdvicePolicyMode(rawValue: value) else {
+                    throw ArgsError.invalidValue(flag: flag, value: value)
+                }
+                rdadvisePolicy = parsed
             default:
                 throw ArgsError.unknownFlag(flag)
             }
@@ -360,35 +451,42 @@ extension Args {
                 flag: "--top-p",
                 value: "\(topP) requires --top-k between 1 and 256")
         }
-        return Args(model: model,
-                    prompt: prompt,
-                    messagesFile: messagesFile,
-                    batchFile: batchFile,
-                    maxNew: maxNew,
-                    maxNewExplicit: maxNewExplicit,
-                    maxContext: maxContext,
-                    temperature: temperature,
-                    temperatureExplicit: temperatureExplicit,
-                    topK: topK,
-                    topP: topP,
-                    repetitionPenalty: repetitionPenalty,
-                    seed: seed,
-                    stops: stops,
-                    quiet: quiet,
-                    reasoningEffort: reasoningEffort,
-                    noThinking: noThinking,
-                    prefill: prefill,
-                    prefillChunk: prefillChunk,
-                    expertPredict: expertPredict,
-                    expertPredictSelective: expertPredictSelective,
-                    expertCacheGiB: expertCacheGiB,
-                    expertShardRoots: expertShardRoots,
-                    expertIOWorkers: expertIOWorkers,
-                    expertIOSplits: expertIOSplits,
-                    expertIOCache: expertIOCache,
-                    modelVerification: modelVerification,
-                    k3ActivationDiagnostics: k3ActivationDiagnostics,
-                    verbose: verbose)
+        let arguments = Args(model: model,
+                             prompt: prompt,
+                             messagesFile: messagesFile,
+                             batchFile: batchFile,
+                             maxNew: maxNew,
+                             maxNewExplicit: maxNewExplicit,
+                             maxContext: maxContext,
+                             temperature: temperature,
+                             temperatureExplicit: temperatureExplicit,
+                             topK: topK,
+                             topP: topP,
+                             repetitionPenalty: repetitionPenalty,
+                             seed: seed,
+                             stops: stops,
+                             quiet: quiet,
+                             expertCacheSlots: expertCacheSlots,
+                             expertCachePolicy: expertCachePolicy,
+                             prefillPolicy: prefillPolicy,
+                             prefillChunkTokens: prefillChunkTokens,
+                             rdadvisePolicy: rdadvisePolicy,
+                             reasoningEffort: reasoningEffort,
+                             noThinking: noThinking,
+                             prefill: prefill,
+                             prefillChunk: prefillChunk,
+                             expertPredict: expertPredict,
+                             expertPredictSelective: expertPredictSelective,
+                             expertCacheGiB: expertCacheGiB,
+                             expertShardRoots: expertShardRoots,
+                             expertIOWorkers: expertIOWorkers,
+                             expertIOSplits: expertIOSplits,
+                             expertIOCache: expertIOCache,
+                             modelVerification: modelVerification,
+                             k3ActivationDiagnostics: k3ActivationDiagnostics,
+                             verbose: verbose)
+        _ = try arguments.resolvedRuntimeConfiguration(forceLogitsHead: false)
+        return arguments
     }
 
     private static func takeValue(_ argv: [String],
