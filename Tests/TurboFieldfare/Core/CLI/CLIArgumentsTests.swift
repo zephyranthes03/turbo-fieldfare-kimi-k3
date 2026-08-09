@@ -8,8 +8,10 @@ import Testing
         #expect(arguments.prompt == "hi")
         #expect(arguments.messagesFile == nil)
         #expect(arguments.maxNew == 1_024)
+        #expect(!arguments.maxNewExplicit)
         #expect(arguments.maxContext == 4096)
         #expect(arguments.temperature == 0.2)
+        #expect(!arguments.temperatureExplicit)
         #expect(arguments.topK == 64)
         #expect(arguments.topP == 0.95)
         #expect(arguments.repetitionPenalty == 1)
@@ -27,8 +29,10 @@ import Testing
             "--stop", "A", "--stop", "B", "--quiet",
         ])
         #expect(arguments.maxNew == 32)
+        #expect(arguments.maxNewExplicit)
         #expect(arguments.maxContext == 512)
         #expect(arguments.temperature == 0)
+        #expect(arguments.temperatureExplicit)
         #expect(arguments.topK == 40)
         #expect(arguments.topP == 0.95)
         #expect(arguments.repetitionPenalty == 1.1)
@@ -62,9 +66,16 @@ import Testing
 
     @Test func helpListsExactlyThePublicOptions() {
         let expected: Set<String> = [
-            "--model", "--prompt", "--messages-file", "--max-new", "--max-context",
+            "--model", "--prompt", "--messages-file", "--batch-file",
+            "--max-new", "--max-context",
             "--temperature", "--top-k", "--top-p", "--repetition-penalty",
             "--seed", "--stop", "--quiet", "--help",
+            // K3 (.gturbo v2) options.
+            "--reasoning-effort", "--no-thinking", "--prefill", "--prefill-chunk",
+            "--expert-predict", "--expert-cache-gib", "--expert-shard-root",
+            "--expert-io-workers", "--expert-io-splits",
+            "--expert-io-cache", "--model-verification",
+            "--k3-activation-diagnostics", "--verbose",
         ]
         let words = Args.usage.split { $0.isWhitespace || $0 == "(" || $0 == ")" }
         let options = Set(words.map(String.init).filter { $0.hasPrefix("--") })

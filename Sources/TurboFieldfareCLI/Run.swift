@@ -17,6 +17,14 @@ public func run(args: Args,
                 stderr: FileHandle = .standardError) async -> RunResult {
     do {
         let modelURL = URL(fileURLWithPath: args.model)
+        // .gturbo v2 bundles are Kimi K3; v1 is the Gemma path below.
+        let bundle = try GTurboBundleProbe.probe(bundleURL: modelURL)
+        if bundle.isK3 {
+            return await runK3(args: args, stdout: stdout, stderr: stderr)
+        }
+        if args.batchFile != nil {
+            return errored(stderr, "--batch-file is supported only for K3 bundles", 2)
+        }
         let tokenizer = try await GFTokenizer.load(forModelDirectory: modelURL)
         let promptIds: [Int32]
         if let rawPrompt = args.prompt {

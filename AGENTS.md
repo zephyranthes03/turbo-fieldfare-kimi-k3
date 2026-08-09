@@ -18,6 +18,7 @@ Mac app.
 ```bash
 swift run -c release TurboFieldfareRepack --output scratch/gemma4.gturbo
 swift run -c release TurboFieldfareRepack --output scratch/gemma4.gturbo --resume
+swift run -c release TurboFieldfareRepack --model-family kimi-k3 --output scratch/kimi-k3.gturbo
 swift build -c release
 .build/release/TurboFieldfareMac
 swift run -c release TurboFieldfareCLI \
@@ -27,6 +28,74 @@ swift run -c release TurboFieldfareCLI \
 ```
 
 The installer streams the pinned model without staging the full source checkpoint. Set `HF_TOKEN` only if requested. The download is about 15 GB. Cancellation preserves verified completed ranges; continue them with `--resume` or remove them with `--discard-partial --output scratch/gemma4.gturbo`.
+
+## Kimi K3 (`.gturbo` v2)
+
+This fork also runs Kimi K3 (2.78T MoE: 93 layers = 69 KDA + 24 NoPE-MLA,
+896 experts top-16 in a 3584-wide LatentMoE, AttnRes residual blocks) on a
+128 GB Apple Silicon Mac by streaming the MXFP4 experts from SSD; design
+basis and feasibility math live in
+[docs/KIMI_K3_EVALUATION.md](docs/KIMI_K3_EVALUATION.md) and the exact engine
+dataflow contract in [docs/K3_DATAFLOW.md](docs/K3_DATAFLOW.md). The v2 wire
+format is pinned by golden fixtures in
+`Tests/TurboFieldfareFormatCompatibility/Fixtures/v2/`; v1 behavior and
+fixtures must keep passing unchanged.
+
+```bash
+# Install (streams the pinned moonshotai/Kimi-K3 revision; ~1.5 TB out, resumable)
+swift run -c release TurboFieldfareRepack \
+  --model-family kimi-k3 --output scratch/kimi-k3.gturbo
+swift run -c release TurboFieldfareRepack \
+  --model-family kimi-k3 --output scratch/kimi-k3.gturbo --resume
+# `--trunk-quant int8` trades ~28 GB more residency for trunk quality headroom.
+
+# Run (CLI auto-detects v1 vs v2 bundles)
+swift run -c release TurboFieldfareCLI \
+  --model scratch/kimi-k3.gturbo \
+  --prompt "The capital of France is" --max-new 64
+# Chat: --messages-file messages.json --reasoning-effort low|high|max
+# Batch: --batch-file jobs.jsonl (loads the engine once, JSONL in/out; see
+#        docs/K3_DISK_RUNTIME.md)
+# Context: --max-context up to 262144 (K3 only; Gemma stays capped at 65536)
+# Prefill: --prefill chunked --prefill-chunk 32|64|128|256 (32 is the K3 default; NAX on M5)
+# Expert prefetch: --expert-predict off|selective|on (default off — measured
+#        slower than on-demand reads on real weights, see
+#        docs/KIMI_K3_EVALUATION.md §5)
+# Expert cache: --expert-cache-gib 0...64 (default 0; exact direct-resident RAM
+#        banks, opt-in — see docs/K3_DISK_RUNTIME.md before raising it)
+# Multi-SSD: --expert-shard-root <path> (repeat once per prepared shard root)
+# I/O: whole-expert reads, auto workers 1/2/4, F_NOCACHE for production K3
+# Overrides: --expert-io-splits 1|2|4|8 --expert-io-workers auto|1...32
+#            --expert-io-cache auto|buffered|uncached
+# Fast startup after a completed verified install: --model-verification trusted-install
+# Diagnostics: --k3-activation-diagnostics compares real embedding/layer-0
+#        activations against a scalar CPU reference (--verbose adds
+#        expert-streaming counters to the footer)
+
+# Serve
+swift run -c release TurboFieldfareServer --model scratch/kimi-k3.gturbo
+# The same --prefill-chunk/--expert-predict/--expert-cache-gib/--expert-shard-root/
+# --expert-io-* controls are available on the server executable.
+```
+
+Reality check: decode reads ~25.8 GB of experts per token from SSD, so expect
+roughly 0.3–1 tok/s — this is a batch/research runtime, not an interactive
+chat engine. A real-checkpoint run on the validated 128 GB M5 Max (chunked
+32-token prefill, `--expert-predict off`, `--expert-cache-gib 16`,
+`--expert-io-cache uncached`, 262144-token context) measured 0.512 tok/s
+decode and a 51.9 s TTFT over a 3-chunk prefill, inside this estimate; 16 GiB
+was chosen over 8/24 GiB by a real-checkpoint A/B (docs/K3_DISK_RUNTIME.md
+§Cache-size sweep) — 24 GiB reads less from SSD but runs ~51% slower once its
+memory pressure outweighs the I/O saved at this context length.
+Resident budget is ~38 GB wired at the default int4 trunk
+profile; the OS page cache absorbs expert reuse. The server retains one exact
+prompt prefix by snapshotting KDA/conv, active MLA rows, last logits, and
+routing predictions; hits report `cached_tokens`, and any token mismatch
+falls back to full prefill. The `stop` request field is rejected for K3
+(token-level stop only). All K3 code lives in K3-namespaced files
+(`Runtime/K3/`, `Metal/K3/`, `Tokenization/K3*`, repack `Core/K3/`); tests are
+`Tests/**/K3*/` and run with the same `Scripts/test.sh` rules below — K3 tests
+use synthetic tiny bundles, never the real checkpoint.
 
 ## Local server
 
@@ -44,7 +113,22 @@ the server is needed, and stop only a server you launched.
 
 Before a model run, require macOS 26+, Swift 6.2+, enough disk, acceptable `memory_pressure -Q`, a completed `scratch/gemma4.gturbo`, and no process from `pgrep -fl 'TurboFieldfareServer|TurboFieldfareMac|TurboFieldfareDecodeService|TurboFieldfareCLI|TurboFieldfarePackageTests|swiftpm-testing-helper|mlx_lm|mlx-lm'`. If a check fails, inform the user and stop; do not terminate apps or delete or reinstall the model.
 
+On a host with only Command Line Tools (no Xcode), `/usr/bin/swift` cannot compile
+this package's manifest (`.macOS(.v26)` needs a newer `PackageDescription`) —
+install a swift.org 6.3+ toolchain and put its `usr/bin` ahead of `PATH` (the
+`TOOLCHAINS` environment variable is ignored without Xcode present, so `PATH`
+is the only way to select it). `Package.swift` auto-detects Xcode via
+`TF_PREVIEWS` to skip `#Preview` macro compilation when it's absent; this
+needs no action, but if `swift build`/`swift test` fail specifically in
+`Sources/TurboFieldfareApp/Mac/Generation/OutputPaneView.swift`, an Xcode-less
+host is the cause.
+
 Run package tests through `Scripts/test.sh`. Run only one app, CLI, or model-using test at a time.
+`DecodeServiceResponseMatchingTests.concurrentWaitersReceiveOnlyTheirOwnResponses`
+is a known pre-existing flaky crash (concurrent waiters racing a `Pipe`
+teardown), unrelated to K3; skip it with `Scripts/test.sh --skip
+concurrentWaitersReceiveOnlyTheirOwnResponses` rather than treating a crash
+there as a new regression.
 
 For performance results, build release once and follow the [community benchmark guide](docs/COMMUNITY_BENCHMARKS.md) exactly. Do not enable experimental controls or profiling.
 

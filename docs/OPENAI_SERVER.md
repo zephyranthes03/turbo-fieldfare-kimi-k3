@@ -1,8 +1,9 @@
 # Local OpenAI-compatible server
 
-`TurboFieldfareServer` exposes a local Chat Completions API for one Gemma
-model. It binds to `127.0.0.1` without authentication or TLS. Do not expose it
-through a proxy or tunnel.
+`TurboFieldfareServer` exposes a local Chat Completions API for one loaded
+model — either Gemma 4 26B-A4B (`.gturbo` v1) or Kimi K3 (`.gturbo` v2,
+see [Kimi K3 bundles](#kimi-k3-bundles) below). It binds to `127.0.0.1`
+without authentication or TLS. Do not expose it through a proxy or tunnel.
 
 ## Start the server
 
@@ -122,18 +123,52 @@ Pi uses its `openai-completions` adapter:
 
 Keep the client context setting at or below the server's `--max-context`.
 
+For a K3 batch/research server on a 128 GB machine, the disk-oriented controls
+are also available on the server executable:
+
+```bash
+swift run -c release TurboFieldfareServer \
+  --model scratch/kimi-k3.gturbo \
+  --max-context 262144 \
+  --prompt-cache-mode single-prefix \
+  --prefill-chunk 32 \
+  --expert-predict off \
+  --expert-cache-gib 16 \
+  --expert-io-workers auto \
+  --expert-io-splits 1 \
+  --expert-io-cache uncached \
+  --model-verification trusted-install
+```
+
+The direct-resident RAM banks are optional and compete with the int8 trunk,
+the MLA context cache, applications, and the OS. Only the currently executing
+layer receives a Metal view, avoiding a full GPU working-set reservation equal
+to the cache size. 24 GiB covers 91 of 92 MoE layers without cache-to-compute
+copies, but at the 262144-token context ceiling the MLA cache and int8 trunk
+leave less headroom — an 8/16/24 GiB A/B on the real checkpoint at this
+context confirmed 16 GiB as the correct default: it decodes as fast as
+8 GiB while reading noticeably less from SSD, whereas 24 GiB's larger cache
+reads the least but runs ~51% slower once its memory pressure outweighs the
+I/O it saves. See
+[docs/K3_DISK_RUNTIME.md#cache-size-sweep-8--16--24-gib-real-checkpoint-262144-context](docs/K3_DISK_RUNTIME.md#cache-size-sweep-8--16--24-gib-real-checkpoint-262144-context)
+for the full numbers. Check `memory_pressure -Q`; reduce the budget to 16 or
+8 GiB before reducing context if pressure is poor. Repeating
+`--expert-shard-root /Volumes/...` enables a prepared multi-SSD stripe set.
+
 ## Prompt reuse
 
-Single-prefix KV reuse is on by default. Send the complete message history with
-every request. When a request continues the retained conversation exactly, the
-server reuses the verified KV prefix and reports the number of reused tokens in:
+Single-prefix state reuse is on by default. Send the complete message history
+with every request. When a request continues the retained conversation exactly,
+the server reuses the verified prefix and reports the number of reused tokens in:
 
 ```text
 usage.prompt_tokens_details.cached_tokens
 ```
 
 The server retains one prefix. A different or incompatible history replaces
-it. Use `--prompt-cache-mode off` to disable reuse.
+it. Gemma retains its KV state; K3 retains the full recurrent KDA/conv state,
+active MLA rows, last logits, and routing-predictor history. Both paths require
+exact token-prefix identity. Use `--prompt-cache-mode off` to disable reuse.
 
 ## Tool calls
 
@@ -189,3 +224,29 @@ watch memory pressure.
 For long requests, stderr reports the request lifecycle as prepared, queued,
 generating, completed, or failed. It includes token counts and timing, but not
 prompt text, tool arguments, headers, or request bodies.
+
+## Kimi K3 bundles
+
+When `--model` points at a `.gturbo` **v2** bundle (Kimi K3), the server probes
+the manifest and serves the K3 engine instead of Gemma. Differences from the
+Gemma behavior above:
+
+- The model id defaults to the bundle's manifest id (for example `Kimi-K3`);
+  `--model-id` still overrides.
+- Requests accept an optional `reasoning_effort` field (`"low"`, `"high"`, or
+  `"max"`; anything else is a 400). Thinking is always on; assistant responses
+  carry `reasoning_content` alongside `content`, and streamed reasoning arrives
+  as `reasoning_content` deltas. Multi-turn clients must send prior assistant
+  turns back with both `reasoning_content` and `tool_calls` intact — dropping
+  them degrades the model (upstream serving requirement).
+- `tool_choice` accepts `"auto"`, `"none"`, and `"required"`.
+- The `stop` field is rejected with a 400 for K3 (token-level stop only);
+  `max_tokens`/`max_completion_tokens` work as usual. Generation stops at the
+  model's `<|end_of_msg|>` token.
+- Single-prefix state reuse is enabled by default. K3 snapshots the recurrent
+  KDA/conv state, active MLA cache rows, last logits, and routing-predictor
+  history; a token mismatch falls back to a full prefill. Hits report their
+  exact reused count in `cached_tokens`. Use `--prompt-cache-mode off` to
+  disable it.
+- Decode speed is SSD-bound: plan for roughly 0.3–1 tok/s and size client
+  timeouts accordingly. Prefill uses the chunked NAX path by default.

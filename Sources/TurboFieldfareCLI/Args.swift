@@ -2,40 +2,102 @@ public struct Args: Equatable, Sendable {
     public var model: String
     public var prompt: String?
     public var messagesFile: String?
+    /// K3-only JSONL batch input. Each row has `prompt` or `messages`.
+    public var batchFile: String?
     public var maxNew: Int
+    /// Tracks CLI intent so K3 can use its own operational default without
+    /// changing Gemma's established public default.
+    public var maxNewExplicit: Bool
     public var maxContext: Int
     public var temperature: Float
+    public var temperatureExplicit: Bool
     public var topK: Int?
     public var topP: Float?
     public var repetitionPenalty: Float
     public var seed: UInt64?
     public var stops: [String]
     public var quiet: Bool
+    // K3 (.gturbo v2) options; ignored on the Gemma (v1) path.
+    public var reasoningEffort: String?
+    public var noThinking: Bool
+    public var prefill: String
+    public var prefillChunk: Int
+    public var expertPredict: Bool
+    public var expertPredictSelective: Bool
+    /// Exact per-layer direct-resident RAM banks; zero disables them.
+    public var expertCacheGiB: Int
+    /// External striped expert roots, one `expert-shard.json` per SSD.
+    public var expertShardRoots: [String]
+    /// `auto` or a fixed bounded worker count (`1...32`).
+    public var expertIOWorkers: String
+    /// Page-aligned subreads per expert. The K3 default is one whole-expert read.
+    public var expertIOSplits: Int
+    /// `auto`, `buffered`, or Darwin `F_NOCACHE` expert reads.
+    public var expertIOCache: String
+    /// Full hashes by default; trusted-install is an explicit startup tradeoff.
+    public var modelVerification: String
+    /// Validate a real first-token activation before K3 generation.
+    public var k3ActivationDiagnostics: Bool
+    public var verbose: Bool
 
     public init(model: String,
                 prompt: String? = nil,
                 messagesFile: String? = nil,
+                batchFile: String? = nil,
                 maxNew: Int = 1_024,
+                maxNewExplicit: Bool = false,
                 maxContext: Int = 4096,
                 temperature: Float = 0.2,
+                temperatureExplicit: Bool = false,
                 topK: Int? = 64,
                 topP: Float? = 0.95,
                 repetitionPenalty: Float = 1.0,
                 seed: UInt64? = nil,
                 stops: [String] = [],
-                quiet: Bool = false) {
+                quiet: Bool = false,
+                reasoningEffort: String? = nil,
+                noThinking: Bool = false,
+                prefill: String = "chunked",
+                prefillChunk: Int = 32,
+                expertPredict: Bool = false,
+                expertPredictSelective: Bool = false,
+                expertCacheGiB: Int = 0,
+                expertShardRoots: [String] = [],
+                expertIOWorkers: String = "auto",
+                expertIOSplits: Int = 1,
+                expertIOCache: String = "auto",
+                modelVerification: String = "full-sha256",
+                k3ActivationDiagnostics: Bool = false,
+                verbose: Bool = false) {
         self.model = model
         self.prompt = prompt
         self.messagesFile = messagesFile
+        self.batchFile = batchFile
         self.maxNew = maxNew
+        self.maxNewExplicit = maxNewExplicit
         self.maxContext = maxContext
         self.temperature = temperature
+        self.temperatureExplicit = temperatureExplicit
         self.topK = topK
         self.topP = topP
         self.repetitionPenalty = repetitionPenalty
         self.seed = seed
         self.stops = stops
         self.quiet = quiet
+        self.reasoningEffort = reasoningEffort
+        self.noThinking = noThinking
+        self.prefill = prefill
+        self.prefillChunk = prefillChunk
+        self.expertPredict = expertPredict
+        self.expertPredictSelective = expertPredictSelective
+        self.expertCacheGiB = expertCacheGiB
+        self.expertShardRoots = expertShardRoots
+        self.expertIOWorkers = expertIOWorkers
+        self.expertIOSplits = expertIOSplits
+        self.expertIOCache = expertIOCache
+        self.modelVerification = modelVerification
+        self.k3ActivationDiagnostics = k3ActivationDiagnostics
+        self.verbose = verbose
     }
 }
 
@@ -56,7 +118,8 @@ public enum ArgsError: Error, Equatable, CustomStringConvertible {
         case .invalidValue(let flag, let value): return "invalid value for \(flag): \(value)"
         case .requiredMissing(let flag): return "required flag missing: \(flag)"
         case .mutuallyExclusive(let a, let b): return "\(a) and \(b) are mutually exclusive"
-        case .modeMissing: return "one of --prompt or --messages-file is required"
+        case .modeMissing:
+            return "one of --prompt, --messages-file, or --batch-file is required"
         }
     }
 }
@@ -65,12 +128,13 @@ extension Args {
     public static let usage = """
     TurboFieldfareCLI — Gemma 4 26B-A4B text generation
 
-    usage: TurboFieldfareCLI --model <dir> (--prompt <string> | --messages-file <path>) [options]
+    usage: TurboFieldfareCLI --model <dir> (--prompt <string> | --messages-file <path> | --batch-file <path>) [options]
 
     required:
       --model <dir>             Path to a .gturbo model directory.
       --prompt <string>         Raw-completion prompt.
       --messages-file <path>    JSON chat messages with role and content fields.
+      --batch-file <path>       K3 JSONL jobs; each row contains prompt or messages.
 
     options:
       --max-new <int>           Generated-token limit (default 1024).
@@ -83,21 +147,60 @@ extension Args {
       --stop <string>           Stop substring (repeatable).
       --quiet                   Suppress the timing footer.
       --help                    Show this message.
+
+    K3 (.gturbo v2 bundle) options:
+      --reasoning-effort <e>    Thinking effort: low, high, or max (default off).
+      --no-thinking             Drop the assistant think channel.
+      --prefill <mode>          Prompt prefill: serial or chunked (default chunked).
+      --prefill-chunk <int>     Chunked-prefill chunk tokens: 32, 64, 128, or 256
+                                (K3 default 32).
+      --expert-predict <mode>   off, selective, or on/full (default off).
+      --expert-cache-gib <n>   Exact direct-resident expert banks, 0...64 GiB (default 0).
+      --expert-shard-root <p>  External striped expert root (repeat for every shard).
+      --expert-io-workers <n>   Bounded pread workers: auto or 1...32
+                                (default auto; measures 1, 2, and 4).
+      --expert-io-splits <n>    Page-aligned reads per expert: 1, 2, 4, or 8
+                                (K3 default 1 whole-expert read).
+      --expert-io-cache <mode>  auto, buffered, or uncached (F_NOCACHE)
+                                (default auto; production K3 uses uncached).
+      --model-verification <m>  full-sha256 or trusted-install
+                                (default full-sha256).
+      --k3-activation-diagnostics
+                                Compare real embedding and layer-0 input-norm
+                                activations against a scalar CPU reference.
+      --verbose                 Extra expert-streaming stats after the footer.
     """
 
     public static func parse(_ argv: [String]) throws -> Args {
         var model: String?
         var prompt: String?
         var messagesFile: String?
+        var batchFile: String?
         var maxNew = 1_024
+        var maxNewExplicit = false
         var maxContext = 4096
         var temperature: Float = 0.2
+        var temperatureExplicit = false
         var topK: Int? = 64
         var topP: Float? = 0.95
         var repetitionPenalty: Float = 1.0
         var seed: UInt64?
         var stops: [String] = []
         var quiet = false
+        var reasoningEffort: String?
+        var noThinking = false
+        var prefill = "chunked"
+        var prefillChunk = 32
+        var expertPredict = false
+        var expertPredictSelective = false
+        var expertCacheGiB = 0
+        var expertShardRoots: [String] = []
+        var expertIOWorkers = "auto"
+        var expertIOSplits = 1
+        var expertIOCache = "auto"
+        var modelVerification = "full-sha256"
+        var k3ActivationDiagnostics = false
+        var verbose = false
 
         var index = 0
         while index < argv.count {
@@ -108,18 +211,93 @@ extension Args {
             case "--quiet":
                 quiet = true
                 index += 1
+            case "--no-thinking":
+                noThinking = true
+                index += 1
+            case "--verbose":
+                verbose = true
+                index += 1
+            case "--k3-activation-diagnostics":
+                k3ActivationDiagnostics = true
+                index += 1
+            case "--reasoning-effort":
+                let value = try takeValue(argv, &index, flag: flag)
+                guard ["low", "high", "max"].contains(value) else {
+                    throw ArgsError.invalidValue(flag: flag, value: value)
+                }
+                reasoningEffort = value
+            case "--prefill":
+                let value = try takeValue(argv, &index, flag: flag)
+                guard ["serial", "chunked"].contains(value) else {
+                    throw ArgsError.invalidValue(flag: flag, value: value)
+                }
+                prefill = value
+            case "--prefill-chunk":
+                let value = try takeValue(argv, &index, flag: flag)
+                guard let parsed = Int(value), [32, 64, 128, 256].contains(parsed) else {
+                    throw ArgsError.invalidValue(flag: flag, value: value)
+                }
+                prefillChunk = parsed
+            case "--expert-predict":
+                let value = try takeValue(argv, &index, flag: flag)
+                guard ["on", "full", "selective", "off"].contains(value) else {
+                    throw ArgsError.invalidValue(flag: flag, value: value)
+                }
+                expertPredict = value != "off"
+                expertPredictSelective = value == "selective"
+            case "--expert-cache-gib":
+                let value = try takeValue(argv, &index, flag: flag)
+                guard let parsed = Int(value), (0...64).contains(parsed) else {
+                    throw ArgsError.invalidValue(flag: flag, value: value)
+                }
+                expertCacheGiB = parsed
+            case "--expert-shard-root":
+                let value = try takeValue(argv, &index, flag: flag)
+                guard !value.isEmpty else {
+                    throw ArgsError.invalidValue(flag: flag, value: value)
+                }
+                expertShardRoots.append(value)
+            case "--expert-io-workers":
+                let value = try takeValue(argv, &index, flag: flag)
+                if value != "auto" {
+                    guard let parsed = Int(value), (1...32).contains(parsed) else {
+                        throw ArgsError.invalidValue(flag: flag, value: value)
+                    }
+                }
+                expertIOWorkers = value
+            case "--expert-io-splits":
+                let value = try takeValue(argv, &index, flag: flag)
+                guard let parsed = Int(value), [1, 2, 4, 8].contains(parsed) else {
+                    throw ArgsError.invalidValue(flag: flag, value: value)
+                }
+                expertIOSplits = parsed
+            case "--expert-io-cache":
+                let value = try takeValue(argv, &index, flag: flag)
+                guard ["auto", "buffered", "uncached"].contains(value) else {
+                    throw ArgsError.invalidValue(flag: flag, value: value)
+                }
+                expertIOCache = value
+            case "--model-verification":
+                let value = try takeValue(argv, &index, flag: flag)
+                guard ["full-sha256", "trusted-install"].contains(value) else {
+                    throw ArgsError.invalidValue(flag: flag, value: value)
+                }
+                modelVerification = value
             case "--model":
                 model = try takeValue(argv, &index, flag: flag)
             case "--prompt":
                 prompt = try takeValue(argv, &index, flag: flag)
             case "--messages-file":
                 messagesFile = try takeValue(argv, &index, flag: flag)
+            case "--batch-file":
+                batchFile = try takeValue(argv, &index, flag: flag)
             case "--max-new":
                 let value = try takeValue(argv, &index, flag: flag)
                 guard let parsed = Int(value), parsed > 0 else {
                     throw ArgsError.invalidValue(flag: flag, value: value)
                 }
                 maxNew = parsed
+                maxNewExplicit = true
             case "--max-context":
                 let value = try takeValue(argv, &index, flag: flag)
                 guard let parsed = Int(value), parsed > 0 else {
@@ -132,6 +310,7 @@ extension Args {
                     throw ArgsError.invalidValue(flag: flag, value: value)
                 }
                 temperature = parsed
+                temperatureExplicit = true
             case "--top-k":
                 let value = try takeValue(argv, &index, flag: flag)
                 guard let parsed = Int(value), (0...256).contains(parsed) else {
@@ -167,7 +346,15 @@ extension Args {
         if prompt != nil && messagesFile != nil {
             throw ArgsError.mutuallyExclusive("--prompt", "--messages-file")
         }
-        if prompt == nil && messagesFile == nil { throw ArgsError.modeMissing }
+        if prompt != nil && batchFile != nil {
+            throw ArgsError.mutuallyExclusive("--prompt", "--batch-file")
+        }
+        if messagesFile != nil && batchFile != nil {
+            throw ArgsError.mutuallyExclusive("--messages-file", "--batch-file")
+        }
+        let modes = [prompt != nil, messagesFile != nil, batchFile != nil]
+            .filter { $0 }.count
+        if modes == 0 { throw ArgsError.modeMissing }
         if temperature > 0, topK == nil, let topP, topP < 1 {
             throw ArgsError.invalidValue(
                 flag: "--top-p",
@@ -176,15 +363,32 @@ extension Args {
         return Args(model: model,
                     prompt: prompt,
                     messagesFile: messagesFile,
+                    batchFile: batchFile,
                     maxNew: maxNew,
+                    maxNewExplicit: maxNewExplicit,
                     maxContext: maxContext,
                     temperature: temperature,
+                    temperatureExplicit: temperatureExplicit,
                     topK: topK,
                     topP: topP,
                     repetitionPenalty: repetitionPenalty,
                     seed: seed,
                     stops: stops,
-                    quiet: quiet)
+                    quiet: quiet,
+                    reasoningEffort: reasoningEffort,
+                    noThinking: noThinking,
+                    prefill: prefill,
+                    prefillChunk: prefillChunk,
+                    expertPredict: expertPredict,
+                    expertPredictSelective: expertPredictSelective,
+                    expertCacheGiB: expertCacheGiB,
+                    expertShardRoots: expertShardRoots,
+                    expertIOWorkers: expertIOWorkers,
+                    expertIOSplits: expertIOSplits,
+                    expertIOCache: expertIOCache,
+                    modelVerification: modelVerification,
+                    k3ActivationDiagnostics: k3ActivationDiagnostics,
+                    verbose: verbose)
     }
 
     private static func takeValue(_ argv: [String],
